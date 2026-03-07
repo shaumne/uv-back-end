@@ -1,20 +1,15 @@
 """
 Colorimetry service v3 — production-hardened UV sticker colour extraction.
 
-Sticker: sadece mor spektrumu (beyaz → lavanta → mor → indigo). UV% L* ile
-mor kalibrasyon eğrine göre hesaplanır; dozaj bildirimleri bu eğriye göredir.
+Sticker: sadece mor (lavanta, mor, indigo). Beyaz/şeffaf ve mor dışı renkler
+algılanmaz; UV% mor kalibrasyon eğrisi ile hesaplanır.
 
-Pipeline (ROI — Region of Interest, UI kılavuzu ile uyumlu):
-1. Decode image → BGR, resize, LAB Grey-World white balance.
-2. Merkez alanı kes (%45, ekrandaki çember/kare kılavuzu ile aynı oran).
-3. Bu ROI üzerinde mor/şeffaf maskesi uygula; maskeye uyan pikselleri al.
-   Yetersiz piksel → sticker_not_detected (şekil araması yok).
-4. K-Means (k=3) ile dominant renk; skill: en çok piksel içeren küme.
-5. Dominant HEX → LAB L* → mor kalibrasyon eğrisi ile UV%.
-
-ROI-only (no contour search): merkez %45 kare UI kılavuzu ile hizalı;
-şekil araması yok, sadece bu alandaki mor/şeffaf pikseller okunur.
-HSV maskesi ışık/gölge toleransı için hafif geniş (H 100–178, taze S≤25).
+Pipeline (ROI, UI kılavuzu ile uyumlu):
+1. Decode → BGR, resize, LAB white balance.
+2. ROI (merkez %45 veya client pre_cropped ile tüm görüntü).
+3. Sadece mor HSV maskesi (H 100–178, S ≥ 10); beyaz/şeffaf dahil değil.
+4. K-Means (k=3) → dominant renk; sadece mor kabul (_is_sticker_plausible_colour).
+5. Dominant HEX → L* → UV%.
 
 Required packages: opencv-python-headless, scikit-learn, scipy, numpy
 """
@@ -260,24 +255,19 @@ def _white_balance_lab(image: np.ndarray) -> np.ndarray:
 
 def _build_sticker_mask(image: np.ndarray) -> np.ndarray:
     """
-    Builds a binary mask for potential sticker regions using HSV.
+    Binary mask: sadece mor (eflatun, lavanta, mor, indigo). Beyaz/şeffaf dahil değil.
 
-    Sticker: mor spektrumu + taze (beyaz/şeffaf). Sadece merkez ROI'ye uygulandığı
-    için aralıklar ışık/gölge toleransı için hafif geniş (H 100–178, taze S≤25).
+    OpenCV HSV: H 100–178 mor spektrumu. Minimum S ile beyaz/şeffaf (S≈0) elenir.
     """
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-    # Mor / doygun: H 100–178 (eflatun, mor, indigo), S ≥ 25
-    purple_vivid = cv2.inRange(hsv, (100, 25, 25), (178, 255, 255))
+    # Mor / doygun: H 100–178, S ≥ 20 (beyaz değil)
+    purple_vivid = cv2.inRange(hsv, (100, 20, 30), (178, 255, 255))
 
-    # Açık mor / soluk lavanta: H 100–178, düşük S
-    purple_pale = cv2.inRange(hsv, (100, 3, 40), (178, 55, 255))
-
-    # Taze sticker: parlak, doygunluk düşük (beyaz/şeffaf); ışık varyasyonu için V≥170, S≤25
-    fresh_mask = cv2.inRange(hsv, (0, 0, 170), (179, 25, 255))
+    # Açık mor / lavanta: H mor, düşük ama sıfır olmayan S (S≥10 → şeffaf/beyaz yok)
+    purple_pale = cv2.inRange(hsv, (100, 10, 40), (178, 55, 255))
 
     combined = cv2.bitwise_or(purple_vivid, purple_pale)
-    combined = cv2.bitwise_or(combined, fresh_mask)
 
     close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
     combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, close_k)
@@ -295,13 +285,13 @@ def _isolate_sticker_pixels(
 ) -> np.ndarray:
     """
     ROI: use_full_image_as_roi=True ise tüm görüntü; değilse merkez %45 kare.
-    Mor/şeffaf maskesi uygulanır; yetersiz piksel → sticker_not_detected.
+    Sadece mor maskesi uygulanır (beyaz/şeffaf dahil değil); yetersiz mor piksel → sticker_not_detected.
 
     Returns:
-        Shape (N, 3) BGR — sticker (mor/şeffaf) pikselleri.
+        Shape (N, 3) BGR — sadece mor pikseller.
 
     Raises:
-        ValueError: sticker_not_detected (hedef alanda yeterli mor/şeffaf yok).
+        ValueError: sticker_not_detected (hedef alanda yeterli mor piksel yok).
     """
     if use_full_image_as_roi:
         roi_image = image
@@ -339,9 +329,8 @@ def _isolate_sticker_pixels(
 
 def _is_sticker_plausible_colour(hex_color: str) -> bool:
     """
-    Sticker sadece mor ve mor tonlarında (beyaz → lavanta → indigo).
-    Sadece mor spektrumu ve akromatik (taze/şeffaf) kabul; turuncu/kırmızı/yeşil
-    vb. reddedilir (kola kutusu, ambalaj vb.).
+    Sadece mor kabul. Beyaz/şeffaf ve mor dışı her renk reddedilir.
+    OpenCV HSV: mor H 108–178 (lavanta, mor, indigo). S=0 / L* çok yüksek = beyaz → False.
     """
     h = hex_color.lstrip("#")
     if len(h) != 6:
@@ -350,19 +339,16 @@ def _is_sticker_plausible_colour(hex_color: str) -> bool:
     bgr = np.uint8([[[b, g, r]]])
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[0][0]
     H, S = int(hsv[0]), int(hsv[1])
-    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)[0][0]
-    l_star = float(lab[0]) / 2.55
 
-    # Akromatik (taze sticker): çok düşük satürasyon veya çok yüksek L*
-    if S <= 30 or l_star >= 90:
-        return True
-    # Sadece mor spektrumu: OpenCV H 110–175 (lavanta, mor, indigo)
+    # Beyaz/şeffaf: doygunluk çok düşük → mor değil
+    if S <= 15:
+        return False
+    # Sadece mor spektrumu: H 108–178 (lavanta, mor, indigo)
     if 108 <= H <= 178:
         return True
-    # Mora yakın magenta: H 175–179
-    if H >= 175:
+    # OpenCV'de H 0–179; mor/magenta sınırı
+    if 175 <= H <= 179:
         return True
-    # Diğer tüm renkler red (turuncu, kırmızı, yeşil, mavi, sarı vb.)
     return False
 
 

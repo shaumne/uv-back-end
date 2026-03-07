@@ -111,7 +111,7 @@ def extract_sticker_data(
     Full colorimetry pipeline: image bytes → (hex_color, uv_percent).
 
     When pre_cropped=True (client sent only the guide region), the whole image
-    is used as ROI. Otherwise the centre 45 % square is used.
+    is used as ROI. Otherwise the centre square (guide ROI fraction) is used.
 
     Args:
         image_bytes: Raw JPEG/PNG bytes from the mobile camera.
@@ -135,7 +135,8 @@ def extract_sticker_data(
     if not _is_sticker_plausible_colour(hex_color):
         logger.warning("[Colorimetry] Dominant colour not sticker-like: %s", hex_color)
         raise ValueError("sticker_not_detected")
-    uv_percent = _hex_to_uv_percent(hex_color)
+    # Doz okuması: sticker onaylandıktan sonra ROI ortanca L* ile (siyah-beyaz mantığı, daha kararlı).
+    uv_percent = _roi_median_l_to_uv_percent(roi_pixels)
 
     logger.info(
         "[Colorimetry] lux=%.1f hex=%s uv_pct=%.1f",
@@ -162,7 +163,7 @@ def detect_sticker_presence(image_bytes: bytes, *, pre_cropped: bool = False) ->
             roi_image = balanced
         else:
             h, w = balanced.shape[:2]
-            size = max(30, int(min(h, w) * 0.45))
+            size = max(30, int(min(h, w) * 0.36))
             cy, cx = h // 2, w // 2
             y1 = max(0, cy - size // 2)
             y2 = min(h, cy + size // 2)
@@ -297,7 +298,7 @@ def _isolate_sticker_pixels(
         roi_image = image
     else:
         h, w = image.shape[:2]
-        size = max(30, int(min(h, w) * 0.45))
+        size = max(30, int(min(h, w) * 0.36))
         cy, cx = h // 2, w // 2
         y1 = max(0, cy - size // 2)
         y2 = min(h, cy + size // 2)
@@ -409,6 +410,27 @@ def _dominant_hex_kmeans(pixels: np.ndarray, k: int = 3) -> str:
 
 
 # ── Step 5 — UV% mapping via LAB L* interpolation ────────────────────────────
+
+def _roi_median_l_to_uv_percent(roi_pixels_bgr: np.ndarray) -> float:
+    """
+    Doz okuması: sticker tespit edildikten sonra kullanılır.
+    ROI piksellerini LAB'ye çevirip yalnızca L* kanalının ortancasını alır,
+    aynı kalibrasyon eğrisi ile UV% döner. Renk gürültüsünü azaltır.
+    roi_pixels_bgr: shape (N, 3) BGR (sadece sticker pikselleri).
+    """
+    lab = cv2.cvtColor(
+        roi_pixels_bgr.reshape(1, -1, 3).astype(np.uint8),
+        cv2.COLOR_BGR2LAB,
+    )
+    l_channel = lab[0, :, 0].astype(np.float64) / 2.55  # 0–100
+    l_median = float(np.median(l_channel))
+    uv_pct = float(np.clip(_UV_CURVE(l_median), 0.0, 100.0))
+    logger.debug(
+        "[Colorimetry] ROI median L*=%.1f → UV%%=%.1f",
+        l_median, uv_pct,
+    )
+    return round(uv_pct, 1)
+
 
 def _hex_to_uv_percent(hex_color: str) -> float:
     """

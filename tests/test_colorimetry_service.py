@@ -14,6 +14,7 @@ from app.services.colorimetry_service import (
     _hex_to_uv_percent,
     _dominant_hex_kmeans,
     _white_balance_lab,
+    _roi_median_l_to_uv_percent,
 )
 
 
@@ -66,6 +67,33 @@ class TestHexToUvPercent:
         """Pure black (L*=0) → 100% UV (clamped; maximum darkening)."""
         pct = _hex_to_uv_percent("#000000")
         assert pct >= 95.0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ROI median L* → UV% (dose reading after sticker detected)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestRoiMedianLToUvPercent:
+    """Sticker tespit edildikten sonra doz = ROI ortanca L* ile aynı eğri."""
+
+    def test_uniform_dark_roi_high_uv(self):
+        """Koyu BGR pikseller → yüksek UV%."""
+        dark_bgr = np.tile([40, 30, 25], (100, 1)).astype(np.uint8)  # koyu
+        pct = _roi_median_l_to_uv_percent(dark_bgr)
+        assert pct >= 70.0, f"Expected high UV%, got {pct:.1f}%"
+
+    def test_uniform_light_roi_low_uv(self):
+        """Açık BGR pikseller → düşük UV%."""
+        light_bgr = np.tile([240, 235, 230], (100, 1)).astype(np.uint8)  # açık
+        pct = _roi_median_l_to_uv_percent(light_bgr)
+        assert pct <= 25.0, f"Expected low UV%, got {pct:.1f}%"
+
+    def test_output_in_range(self):
+        """Sonuç her zaman 0–100 aralığında."""
+        for b, g, r in [(0, 0, 0), (128, 128, 128), (255, 255, 255)]:
+            pixels = np.tile([b, g, r], (50, 1)).astype(np.uint8)
+            pct = _roi_median_l_to_uv_percent(pixels)
+            assert 0.0 <= pct <= 100.0, f"BGR({b},{g},{r}) → {pct} out of range"
 
 
 # ──────────────────────────────────────────────────────────────────────────────

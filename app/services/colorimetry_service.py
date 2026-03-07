@@ -4,28 +4,17 @@ Colorimetry service v3 — production-hardened UV sticker colour extraction.
 Sticker: sadece mor spektrumu (beyaz → lavanta → mor → indigo). UV% L* ile
 mor kalibrasyon eğrine göre hesaplanır; dozaj bildirimleri bu eğriye göredir.
 
-Pipeline (ComputerVision_Colorimetry skill specification):
-1. Decode raw image bytes → BGR NumPy array.
-2. Apply LAB-space Grey-World white balance correction.
-3. Locate the sticker via HSV masking + multi-factor contour scoring.
-   → HSV bands include purple/violet (H 115–170) for mor sticker.
-   → Falls back to centre-crop ROI when no contour scores above threshold.
-4. Extract dominant colour from sticker pixels using K-Means (k=3).
-   Cluster with highest pixel count is dominant (skill); achromatic
-   fallback picks the most chromatic cluster when the largest is artefact.
-5. Map dominant colour → UV% via LAB L* interpolation (scipy).
+Pipeline (ROI — Region of Interest, UI kılavuzu ile uyumlu):
+1. Decode image → BGR, resize, LAB Grey-World white balance.
+2. Merkez alanı kes (%45, ekrandaki çember/kare kılavuzu ile aynı oran).
+3. Bu ROI üzerinde mor/şeffaf maskesi uygula; maskeye uyan pikselleri al.
+   Yetersiz piksel → sticker_not_detected (şekil araması yok).
+4. K-Means (k=3) ile dominant renk; skill: en çok piksel içeren küme.
+5. Dominant HEX → LAB L* → mor kalibrasyon eğrisi ile UV%.
 
-Key improvements vs v2:
-- ALL hard geometry thresholds are significantly relaxed so real-world
-  stickers (small, shot from normal distance, irregular contour, suboptimal
-  lighting) are no longer falsely rejected.
-- Centre-crop fallback: when contour detection yields no candidate above
-  _ANALYZE_CONFIDENCE_THRESHOLD, the central 45 % square of the image is
-  used as the ROI — aligned with the 220 dp guide frame on the scan screen.
-- HSV bands are widened (especially Band 3) to reliably capture near-fresh
-  stickers whose near-white appearance has very low saturation.
-- /detect and /analyze use separate confidence thresholds so the lightweight
-  presence check never gates out a valid full analysis.
+ROI-only (no contour search): merkez %45 kare UI kılavuzu ile hizalı;
+şekil araması yok, sadece bu alandaki mor/şeffaf pikseller okunur.
+HSV maskesi ışık/gölge toleransı için hafif geniş (H 100–178, taze S≤25).
 
 Required packages: opencv-python-headless, scikit-learn, scipy, numpy
 """
@@ -124,10 +113,8 @@ def extract_sticker_data(
     """
     Full colorimetry pipeline: image bytes → (hex_color, uv_percent).
 
-    When contour-based sticker isolation scores below
-    _ANALYZE_CONFIDENCE_THRESHOLD, the function automatically falls back
-    to the centre-crop strategy (45 % square centred on the image), which
-    aligns with the 220 dp guide frame shown on the scan screen.
+    Sticker pikselleri sadece merkez ROI (%45 kare) içinden alınır; kullanıcı
+    ekrandaki kılavuz çerçeveye sticker'ı hizaladığı varsayılır.
 
     Args:
         image_bytes: Raw JPEG/PNG bytes from the mobile camera.
@@ -161,48 +148,44 @@ def extract_sticker_data(
 
 def detect_sticker_presence(image_bytes: bytes) -> dict:
     """
-    Lightweight sticker presence check — no K-Means, no MED calculation.
-
-    Uses _DETECT_CONFIDENCE_THRESHOLD (more lenient than the analyse path)
-    so that a valid sticker at distance or with a subtle colour tint is not
-    falsely rejected before the full /analyze pipeline runs.
-
-    When the best contour scores between 0.0 and _DETECT_CONFIDENCE_THRESHOLD,
-    the function returns detected=True with the actual confidence score rather
-    than blocking the pipeline — the /analyze endpoint will either succeed or
-    return a meaningful error to the user.
+    ROI tabanlı hızlı kontrol: sadece merkez alanı keser, mor/şeffaf piksel sayar.
+    Şekil araması yok; UI kılavuzundaki çembere hizalı sticker varsa algılanır.
 
     Returns:
-        dict with keys: detected (bool), confidence (float), reason (str|None).
-    Never raises — all exceptions are caught and returned as not-detected.
+        dict: detected (bool), confidence (float), reason (str|None).
     """
     try:
         image = _decode_image(image_bytes)
         image = _resize_for_processing(image, _DETECT_MAX_PX)
         _check_lightness(image)
         balanced = _white_balance_lab(image)
-        contour, confidence = _find_best_sticker_contour(balanced)
 
-        if contour is None:
-            logger.debug("[Detect] No contour found — not a sticker.")
-            return {"detected": False, "confidence": 0.0, "reason": "sticker_not_detected"}
+        h, w = balanced.shape[:2]
+        size = max(30, int(min(h, w) * 0.45))
+        cy, cx = h // 2, w // 2
+        y1 = max(0, cy - size // 2)
+        y2 = min(h, cy + size // 2)
+        x1 = max(0, cx - size // 2)
+        x2 = min(w, cx + size // 2)
+        roi_image = balanced[y1:y2, x1:x2]
 
-        if confidence < _DETECT_CONFIDENCE_THRESHOLD:
-            logger.debug("[Detect] Best contour confidence=%.2f below threshold", confidence)
-            return {"detected": False, "confidence": round(confidence, 2), "reason": "sticker_not_detected"}
+        mask = _build_sticker_mask(roi_image)
+        pixel_count = int(np.count_nonzero(mask))
 
-        return {"detected": True, "confidence": round(confidence, 2), "reason": None}
-
+        if pixel_count > _MIN_CONTOUR_PIXELS:
+            return {"detected": True, "confidence": 0.90, "reason": None}
+        return {
+            "detected": False,
+            "confidence": 0.0,
+            "reason": "sticker_not_detected — Çemberin içine sticker'ı hizalayın.",
+        }
     except ValueError as exc:
         reason = str(exc)
         if "insufficient_lighting" in reason or "too dark" in reason.lower():
-            logger.debug("[Detect] Blocked: %s", reason)
             return {"detected": False, "confidence": 0.0, "reason": reason}
-        logger.debug("[Detect] ValueError: %s", reason)
         return {"detected": False, "confidence": 0.0, "reason": reason}
-
     except Exception as exc:
-        logger.warning("[Detect] Unexpected error: %s", exc)
+        logger.warning("[Detect] Error: %s", exc)
         return {"detected": False, "confidence": 0.0, "reason": "processing_error"}
 
 
@@ -273,19 +256,19 @@ def _build_sticker_mask(image: np.ndarray) -> np.ndarray:
     """
     Builds a binary mask for potential sticker regions using HSV.
 
-    Sticker sadece mor spektrumu: beyaz → lavanta → mor → indigo.
-    Sadece mor tonları ve parlak beyaz (taze) maskelenir; kırmızı/turuncu hariç.
+    Sticker: mor spektrumu + taze (beyaz/şeffaf). Sadece merkez ROI'ye uygulandığı
+    için aralıklar ışık/gölge toleransı için hafif geniş (H 100–178, taze S≤25).
     """
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-    # Mor / doygun: sadece H 110–170 (eflatun/mor), S ≥ 30
-    purple_vivid = cv2.inRange(hsv, (110, 30, 30), (170, 255, 255))
+    # Mor / doygun: H 100–178 (eflatun, mor, indigo), S ≥ 25
+    purple_vivid = cv2.inRange(hsv, (100, 25, 25), (178, 255, 255))
 
-    # Açık mor / soluk lavanta: H 110–170, düşük S
-    purple_pale = cv2.inRange(hsv, (110, 5, 50), (170, 50, 255))
+    # Açık mor / soluk lavanta: H 100–178, düşük S
+    purple_pale = cv2.inRange(hsv, (100, 3, 40), (178, 55, 255))
 
-    # Taze sticker: parlaklık yüksek, doygunluk sıfıra yakın (beyaz/şeffaf)
-    fresh_mask = cv2.inRange(hsv, (0, 0, 180), (179, 15, 255))
+    # Taze sticker: parlak, doygunluk düşük (beyaz/şeffaf); ışık varyasyonu için V≥170, S≤25
+    fresh_mask = cv2.inRange(hsv, (0, 0, 170), (179, 25, 255))
 
     combined = cv2.bitwise_or(purple_vivid, purple_pale)
     combined = cv2.bitwise_or(combined, fresh_mask)
@@ -299,146 +282,47 @@ def _build_sticker_mask(image: np.ndarray) -> np.ndarray:
     return combined
 
 
-def _score_contour(contour: np.ndarray, image_area: int) -> float:
-    """
-    Computes a 0.0–1.0 sticker likelihood score for a contour.
-
-    Hard constraints (any failure → 0.0):
-    - Absolute area ≥ _MIN_STICKER_AREA_PX2
-    - Relative area in [_MIN_STICKER_AREA_FRACTION, _MAX_STICKER_AREA_FRACTION]
-    - Aspect ratio (w/h) in [0.70, 1.40] — kare/daireye yakın
-    - Compactness ≥ 0.50 — dağınık/düzensiz bloklar reddedilir
-    - Fill ratio ≥ _MIN_FILL_RATIO
-
-    Soft scores (weighted sum → final score 0.0–1.0):
-    - area_score:    peaks at 3–15 % of image area
-    - aspect_score:  peaks at 1.0 (perfect square/circle)
-    - compact_score: peaks at 1.0 (circle)
-    - fill_score:    peaks at 1.0 (fully filled bounding rect)
-    """
-    area = cv2.contourArea(contour)
-    if area < _MIN_STICKER_AREA_PX2:
-        return 0.0
-
-    rel_area = area / image_area
-    if rel_area < _MIN_STICKER_AREA_FRACTION or rel_area > _MAX_STICKER_AREA_FRACTION:
-        return 0.0
-
-    x, y, w, h = cv2.boundingRect(contour)
-    if h == 0:
-        return 0.0
-
-    aspect = w / h
-    if aspect < _MIN_ASPECT_RATIO or aspect > _MAX_ASPECT_RATIO:
-        return 0.0
-
-    perimeter = cv2.arcLength(contour, closed=True)
-    if perimeter < 1:
-        return 0.0
-
-    compactness = (4.0 * math.pi * area) / (perimeter ** 2)
-    if compactness < _MIN_COMPACTNESS:
-        return 0.0
-
-    bbox_area = w * h
-    fill_ratio = area / bbox_area if bbox_area > 0 else 0.0
-    if fill_ratio < _MIN_FILL_RATIO:
-        return 0.0
-
-    # ── Soft scores ───────────────────────────────────────────────────────────
-    area_score = max(0.0, 1.0 - abs(math.log10(max(rel_area, 1e-6)) + 1.3) / 1.8)
-    area_score = min(1.0, area_score)
-    aspect_score = max(0.0, 1.0 - abs(aspect - 1.0) * 1.1)
-    compact_score = min(compactness, 1.0)
-    fill_score = min(fill_ratio, 1.0)
-
-    score = (
-        0.20 * area_score
-        + 0.20 * aspect_score
-        + 0.40 * compact_score
-        + 0.20 * fill_score
-    )
-    return round(score, 3)
-
-
-def _find_best_sticker_contour(
-    image: np.ndarray,
-) -> tuple[np.ndarray | None, float]:
-    """
-    Finds the contour that best matches the expected sticker shape.
-
-    Returns:
-        (best_contour, confidence) — contour is None if nothing qualifies.
-    """
-    mask = _build_sticker_mask(image)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        logger.debug("[Colorimetry] No contours found in HSV mask")
-        return None, 0.0
-
-    image_area = image.shape[0] * image.shape[1]
-    best_contour = None
-    best_score = 0.0
-
-    for cnt in contours:
-        score = _score_contour(cnt, image_area)
-        if score > best_score:
-            best_score = score
-            best_contour = cnt
-
-    if best_contour is not None:
-        logger.debug("[Colorimetry] Best contour score=%.3f", best_score)
-    else:
-        logger.debug("[Colorimetry] All contours failed hard constraints")
-
-    return best_contour, best_score
-
-
 def _isolate_sticker_pixels(image: np.ndarray) -> np.ndarray:
     """
-    Locates the sticker contour and returns the pixels inside it.
+    ROI (Region of Interest) yaklaşımı: kullanıcı ekrandaki çember/kare kılavuza
+    sticker'ı oturttuğu için sadece merkez alanı keser, şekil araması yapmaz.
 
-    Skill: sticker region must be found via contour; no centre-crop fallback.
-    Random objects (cola can, packaging, etc.) must not be accepted — only
-    a contour that scores above _ANALYZE_CONFIDENCE_THRESHOLD is used.
+    Akış: Merkezi kes (UI kılavuzu ile aynı oran, %45) → mor/şeffaf maskesi uygula
+    → maskeye uyan pikselleri döndür. Yetersiz piksel varsa sticker_not_detected.
 
     Returns:
-        1-D array of shape (N, 3) — BGR pixel values inside the sticker contour.
+        Shape (N, 3) BGR — sadece merkez alandaki sticker (mor/şeffaf) pikselleri.
 
     Raises:
-        ValueError: sticker_not_detected, sticker_too_small.
+        ValueError: sticker_not_detected (hedef alanda yeterli mor/şeffaf yok).
     """
-    best_contour, confidence = _find_best_sticker_contour(image)
+    h, w = image.shape[:2]
+    size = max(30, int(min(h, w) * 0.45))
+    cy, cx = h // 2, w // 2
+    y1 = max(0, cy - size // 2)
+    y2 = min(h, cy + size // 2)
+    x1 = max(0, cx - size // 2)
+    x2 = min(w, cx + size // 2)
 
-    if best_contour is None or confidence < _ANALYZE_CONFIDENCE_THRESHOLD:
-        logger.info(
-            "[Colorimetry] No sticker contour above threshold (confidence=%.2f). Rejecting.",
-            confidence if best_contour is not None else 0.0,
+    roi_image = image[y1:y2, x1:x2]
+    mask = _build_sticker_mask(roi_image)
+    sticker_pixels = roi_image[mask > 0]
+
+    if len(sticker_pixels) < _MIN_CONTOUR_PIXELS:
+        logger.warning(
+            "[Colorimetry] Merkez alanda sticker rengi yetersiz (%d piksel).",
+            len(sticker_pixels),
         )
-        raise ValueError("sticker_not_detected")
-
-    image_area = image.shape[0] * image.shape[1]
-    area = cv2.contourArea(best_contour)
-    rel_area = area / image_area
-
-    if rel_area > _MAX_STICKER_AREA_FRACTION:
-        logger.warning("[Colorimetry] Contour too large (%.1f %% of frame).", rel_area * 100)
-        raise ValueError("sticker_not_detected")
-
-    contour_mask = np.zeros(image.shape[:2], dtype=np.uint8)
-    cv2.drawContours(contour_mask, [best_contour], -1, 255, thickness=cv2.FILLED)
-    pixels = image[contour_mask > 0]
-
-    if len(pixels) < _MIN_CONTOUR_PIXELS:
         raise ValueError(
-            "sticker_too_small — Hold the camera closer to the sticker."
+            "sticker_not_detected — Hedef alanda sticker bulunamadı. "
+            "Lütfen sticker'ı ekrandaki çemberin tam içine hizalayın ve ışığın iyi olduğundan emin olun."
         )
 
     logger.debug(
-        "[Colorimetry] Contour: area=%.0f px² (%.1f %%), confidence=%.2f, pixels=%d",
-        area, rel_area * 100, confidence, len(pixels),
+        "[Colorimetry] ROI: merkez alanda %d sticker pikseli.",
+        len(sticker_pixels),
     )
-    return pixels
+    return sticker_pixels
 
 
 # ── Sticker colour sanity (reject cola, green, blue, etc.) ─────────────────────

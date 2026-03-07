@@ -109,17 +109,20 @@ def _resize_for_processing(image: np.ndarray, max_px: int) -> np.ndarray:
 def extract_sticker_data(
     image_bytes: bytes,
     ambient_lux: float,
+    *,
+    pre_cropped: bool = False,
 ) -> tuple[str, float]:
     """
     Full colorimetry pipeline: image bytes → (hex_color, uv_percent).
 
-    Sticker pikselleri sadece merkez ROI (%45 kare) içinden alınır; kullanıcı
-    ekrandaki kılavuz çerçeveye sticker'ı hizaladığı varsayılır.
+    When pre_cropped=True (client sent only the guide region), the whole image
+    is used as ROI. Otherwise the centre 45 % square is used.
 
     Args:
         image_bytes: Raw JPEG/PNG bytes from the mobile camera.
         ambient_lux: Ambient light sensor reading in lux (used for logging;
                      white balance uses LAB grey-world independently).
+        pre_cropped: If True, treat the entire image as the sticker ROI (no centre crop).
 
     Returns:
         Tuple of (hex_color: str, uv_percent: float).
@@ -132,7 +135,7 @@ def extract_sticker_data(
     image = _resize_for_processing(image, _ANALYZE_MAX_PX)
     _check_lightness(image)
     balanced = _white_balance_lab(image)
-    roi_pixels = _isolate_sticker_pixels(balanced)
+    roi_pixels = _isolate_sticker_pixels(balanced, use_full_image_as_roi=pre_cropped)
     hex_color = _dominant_hex_kmeans(roi_pixels)
     if not _is_sticker_plausible_colour(hex_color):
         logger.warning("[Colorimetry] Dominant colour not sticker-like: %s", hex_color)
@@ -146,10 +149,10 @@ def extract_sticker_data(
     return hex_color, uv_percent
 
 
-def detect_sticker_presence(image_bytes: bytes) -> dict:
+def detect_sticker_presence(image_bytes: bytes, *, pre_cropped: bool = False) -> dict:
     """
-    ROI tabanlı hızlı kontrol: sadece merkez alanı keser, mor/şeffaf piksel sayar.
-    Şekil araması yok; UI kılavuzundaki çembere hizalı sticker varsa algılanır.
+    ROI tabanlı hızlı kontrol: mor/şeffaf piksel sayar.
+    pre_cropped=True ise tüm görüntü ROI; değilse merkez %45 kare.
 
     Returns:
         dict: detected (bool), confidence (float), reason (str|None).
@@ -160,14 +163,17 @@ def detect_sticker_presence(image_bytes: bytes) -> dict:
         _check_lightness(image)
         balanced = _white_balance_lab(image)
 
-        h, w = balanced.shape[:2]
-        size = max(30, int(min(h, w) * 0.45))
-        cy, cx = h // 2, w // 2
-        y1 = max(0, cy - size // 2)
-        y2 = min(h, cy + size // 2)
-        x1 = max(0, cx - size // 2)
-        x2 = min(w, cx + size // 2)
-        roi_image = balanced[y1:y2, x1:x2]
+        if pre_cropped:
+            roi_image = balanced
+        else:
+            h, w = balanced.shape[:2]
+            size = max(30, int(min(h, w) * 0.45))
+            cy, cx = h // 2, w // 2
+            y1 = max(0, cy - size // 2)
+            y2 = min(h, cy + size // 2)
+            x1 = max(0, cx - size // 2)
+            x2 = min(w, cx + size // 2)
+            roi_image = balanced[y1:y2, x1:x2]
 
         mask = _build_sticker_mask(roi_image)
         pixel_count = int(np.count_nonzero(mask))
@@ -282,29 +288,33 @@ def _build_sticker_mask(image: np.ndarray) -> np.ndarray:
     return combined
 
 
-def _isolate_sticker_pixels(image: np.ndarray) -> np.ndarray:
+def _isolate_sticker_pixels(
+    image: np.ndarray,
+    *,
+    use_full_image_as_roi: bool = False,
+) -> np.ndarray:
     """
-    ROI (Region of Interest) yaklaşımı: kullanıcı ekrandaki çember/kare kılavuza
-    sticker'ı oturttuğu için sadece merkez alanı keser, şekil araması yapmaz.
-
-    Akış: Merkezi kes (UI kılavuzu ile aynı oran, %45) → mor/şeffaf maskesi uygula
-    → maskeye uyan pikselleri döndür. Yetersiz piksel varsa sticker_not_detected.
+    ROI: use_full_image_as_roi=True ise tüm görüntü; değilse merkez %45 kare.
+    Mor/şeffaf maskesi uygulanır; yetersiz piksel → sticker_not_detected.
 
     Returns:
-        Shape (N, 3) BGR — sadece merkez alandaki sticker (mor/şeffaf) pikselleri.
+        Shape (N, 3) BGR — sticker (mor/şeffaf) pikselleri.
 
     Raises:
         ValueError: sticker_not_detected (hedef alanda yeterli mor/şeffaf yok).
     """
-    h, w = image.shape[:2]
-    size = max(30, int(min(h, w) * 0.45))
-    cy, cx = h // 2, w // 2
-    y1 = max(0, cy - size // 2)
-    y2 = min(h, cy + size // 2)
-    x1 = max(0, cx - size // 2)
-    x2 = min(w, cx + size // 2)
+    if use_full_image_as_roi:
+        roi_image = image
+    else:
+        h, w = image.shape[:2]
+        size = max(30, int(min(h, w) * 0.45))
+        cy, cx = h // 2, w // 2
+        y1 = max(0, cy - size // 2)
+        y2 = min(h, cy + size // 2)
+        x1 = max(0, cx - size // 2)
+        x2 = min(w, cx + size // 2)
+        roi_image = image[y1:y2, x1:x2]
 
-    roi_image = image[y1:y2, x1:x2]
     mask = _build_sticker_mask(roi_image)
     sticker_pixels = roi_image[mask > 0]
 

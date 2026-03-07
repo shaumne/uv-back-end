@@ -26,7 +26,7 @@ Response (200):
 """
 import logging
 
-from fastapi import APIRouter, File, Request, UploadFile, status
+from fastapi import APIRouter, File, Form, Request, UploadFile, status
 from pydantic import BaseModel
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -56,6 +56,7 @@ class DetectResponse(BaseModel):
 async def detect_sticker(
     request: Request,
     image: UploadFile = File(..., description="Camera preview frame (JPEG/PNG)"),
+    pre_cropped: str | None = Form(None, description="If 'true', image is already cropped to guide ROI"),
 ) -> DetectResponse:
     """
     Runs only the sticker-isolation step of the colorimetry pipeline.
@@ -81,7 +82,8 @@ async def detect_sticker(
         logger.debug("[Detect] Image validation failed: %s", exc)
         return DetectResponse(detected=False, confidence=0.0, reason=str(exc))
 
-    result = detect_sticker_presence(image_bytes)
+    use_full_roi = (pre_cropped or "").strip().lower() == "true"
+    result = detect_sticker_presence(image_bytes, pre_cropped=use_full_roi)
     logger.debug(
         "[Detect] detected=%s confidence=%.2f reason=%s",
         result["detected"], result["confidence"], result.get("reason"),

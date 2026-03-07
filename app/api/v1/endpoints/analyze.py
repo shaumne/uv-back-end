@@ -53,6 +53,7 @@ async def analyze_sticker(
         description="Reserved; sticker reading is used as cumulative dose (J/m²) for this scan",
     ),
     uv_index: float = Form(default=5.0, ge=0, description="Current UV Index"),
+    pre_cropped: str | None = Form(None, description="If 'true', image is already cropped to guide ROI"),
 ) -> AnalyzeResponse:
     """
     Full analysis pipeline:
@@ -84,8 +85,11 @@ async def analyze_sticker(
         ) from exc
 
     # ── Step 2: Colorimetry — hex + UV% ───────────────────────────────────────
+    use_full_roi = (pre_cropped or "").strip().lower() == "true"
     try:
-        hex_color, uv_percent = extract_sticker_data(image_bytes, ambient_lux)
+        hex_color, uv_percent = extract_sticker_data(
+            image_bytes, ambient_lux, pre_cropped=use_full_roi
+        )
     except ValueError as exc:
         err_str = str(exc)
         logger.warning("Colorimetry failed: %s", err_str)

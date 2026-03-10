@@ -76,6 +76,13 @@ _MIN_CONTOUR_PIXELS = 20
 # Mean HSV saturation gate on the extracted ROI (unused when contour-only path).
 _MIN_ROI_SATURATION = 0
 
+# ── Adaptive white balance (lux-based) ───────────────────────────────────────
+# Direct sunlight: sticker can wash out; SoG (p-norm) reduces glare influence.
+_LUX_HIGH_SUN = 10000.0   # lux above this → Shades of Grey
+_LUX_LOW = 300.0          # lux below this → gamma correction then WB
+_SOG_P = 6.0              # p-norm exponent (higher = less influence from extremes)
+_GAMMA_LOW_LIGHT = 0.75   # gamma < 1 brightens (recover dark regions)
+
 
 # ── Image resize helper ───────────────────────────────────────────────────────
 
@@ -115,8 +122,8 @@ def extract_sticker_data(
 
     Args:
         image_bytes: Raw JPEG/PNG bytes from the mobile camera.
-        ambient_lux: Ambient light sensor reading in lux (used for logging;
-                     white balance uses LAB grey-world independently).
+        ambient_lux: Ambient light sensor reading in lux; drives adaptive white
+                     balance (Grey-World / SoG in sun / gamma in low light).
         pre_cropped: If True, treat the entire image as the sticker ROI (no centre crop).
 
     Returns:
@@ -129,7 +136,7 @@ def extract_sticker_data(
     image = _decode_image(image_bytes)
     image = _resize_for_processing(image, _ANALYZE_MAX_PX)
     _check_lightness(image)
-    balanced = _white_balance_lab(image)
+    balanced = _adaptive_white_balance(image, ambient_lux)
     roi_pixels = _isolate_sticker_pixels(balanced, use_full_image_as_roi=pre_cropped)
     hex_color = _dominant_hex_kmeans(roi_pixels)
     if not _is_sticker_plausible_colour(hex_color):
@@ -315,7 +322,7 @@ def _check_lightness(image: np.ndarray) -> None:
         )
 
 
-# ── Step 2 — White balance (LAB Grey-World) ───────────────────────────────────
+# ── Step 2 — White balance (adaptive: Grey-World / SoG / gamma) ───────────────
 
 def _white_balance_lab(image: np.ndarray) -> np.ndarray:
     """
@@ -338,8 +345,64 @@ def _white_balance_lab(image: np.ndarray) -> np.ndarray:
 
     lab = np.clip(lab, 0, 255).astype(np.uint8)
     balanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-    # Skill: mild bilateral for harsh sunlight (d=9, sigmaColor=75, sigmaSpace=75)
     return cv2.bilateralFilter(balanced, d=9, sigmaColor=75, sigmaSpace=75)
+
+
+def _white_balance_lab_sog(image: np.ndarray, p: float = _SOG_P) -> np.ndarray:
+    """
+    Shades of Grey (SoG) white balance in LAB: p-norm instead of mean for A* and B*.
+
+    Reduces the influence of glare and extreme highlights (e.g. direct sun on
+    the sticker), so the dominant colour is not pulled toward white. Used when
+    ambient_lux > _LUX_HIGH_SUN. OpenCV LAB stores A/B in 0–255 (128 = neutral).
+    """
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float64)
+    n = lab[:, :, 1].size
+    eps = 1e-10
+
+    # p-norm grey estimate: (mean(A^p))^(1/p) — high p reduces impact of hotspots
+    avg_a = np.power(
+        np.maximum(np.power(lab[:, :, 1], p).sum() / n, eps), 1.0 / p
+    )
+    avg_b = np.power(
+        np.maximum(np.power(lab[:, :, 2], p).sum() / n, eps), 1.0 / p
+    )
+
+    lab[:, :, 1] -= (avg_a - 128) * (lab[:, :, 0] / 255.0) * 1.1
+    lab[:, :, 2] -= (avg_b - 128) * (lab[:, :, 0] / 255.0) * 1.1
+    lab = np.clip(lab, 0, 255).astype(np.uint8)
+    balanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    return cv2.bilateralFilter(balanced, d=9, sigmaColor=75, sigmaSpace=75)
+
+
+def _gamma_correct(image: np.ndarray, gamma: float) -> np.ndarray:
+    """
+    Gamma correction: out = (in/255)^gamma * 255. Gamma < 1 brightens (low light).
+    """
+    inv_gamma = 1.0 / gamma
+    lut = np.clip(
+        (np.arange(256, dtype=np.float64) / 255.0) ** inv_gamma * 255.0, 0, 255
+    ).astype(np.uint8)
+    return cv2.LUT(image, lut)
+
+
+def _adaptive_white_balance(image: np.ndarray, ambient_lux: float) -> np.ndarray:
+    """
+    Selects white balance strategy from ambient_lux for accurate UV sticker colour.
+
+    - High lux (direct sun): Shades of Grey (p-norm) to avoid glare washing out purple.
+    - Low lux (shadow/indoor): Gamma correction to brighten, then Grey-World.
+    - Normal lux: Standard Grey-World.
+    """
+    if ambient_lux > _LUX_HIGH_SUN:
+        logger.debug("[Colorimetry] Adaptive WB: SoG (lux=%.0f)", ambient_lux)
+        return _white_balance_lab_sog(image)
+    if ambient_lux < _LUX_LOW:
+        logger.debug("[Colorimetry] Adaptive WB: gamma then Grey-World (lux=%.0f)", ambient_lux)
+        brightened = _gamma_correct(image, _GAMMA_LOW_LIGHT)
+        return _white_balance_lab(brightened)
+    logger.debug("[Colorimetry] Adaptive WB: Grey-World (lux=%.0f)", ambient_lux)
+    return _white_balance_lab(image)
 
 
 # ── Step 3 — Sticker isolation ────────────────────────────────────────────────

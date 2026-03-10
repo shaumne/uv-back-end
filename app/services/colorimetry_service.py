@@ -145,10 +145,48 @@ def extract_sticker_data(
     return hex_color, uv_percent
 
 
-def detect_sticker_presence(image_bytes: bytes, *, pre_cropped: bool = False) -> dict:
+def _build_adaptive_sticker_mask(image: np.ndarray, ambient_lux: float) -> np.ndarray:
     """
-    ROI tabanlı hızlı kontrol: mor/şeffaf piksel sayar.
-    pre_cropped=True ise tüm görüntü ROI; değilse merkez %45 kare.
+    Işığa göre esneyen HSV maskesi (sadece mor spektrum).
+
+    Direkt güneşte renkler solar (düşük S), gölgede doygunluk daha belirgin.
+    Bu fonksiyon /detect aşamasında contour tabanlı şekil kontrolü için kullanılır;
+    white balance uygulanmamış görüntü ile çağrılır.
+    """
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+    if ambient_lux > 10000:  # Direkt güneş — renkler solar
+        min_s = 5
+    elif ambient_lux < 300:  # Karanlık / gölge
+        min_s = 15
+    else:  # Normal ışık
+        min_s = 10
+
+    purple_vivid = cv2.inRange(hsv, (100, min_s, 30), (178, 255, 255))
+    purple_pale = cv2.inRange(hsv, (100, max(5, min_s - 5), 40), (178, 55, 255))
+    combined = cv2.bitwise_or(purple_vivid, purple_pale)
+
+    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, close_k)
+    open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    return cv2.morphologyEx(combined, cv2.MORPH_OPEN, open_k)
+
+
+def detect_sticker_presence(
+    image_bytes: bytes,
+    ambient_lux: float = 1000.0,
+    *,
+    pre_cropped: bool = False,
+) -> dict:
+    """
+    ROI tabanlı hızlı kontrol: contour (şekil) analizi ile sticker varlığı.
+
+    /detect aşamasında _white_balance_lab kullanılmaz; Grey-World, kırpılmış
+    mor ağırlıklı görüntüde rengi bozup tişört/sticker ayrımını zorlaştırabilir.
+    Bu aşamada sadece şekil (en/boy oranı, solidity, alan) kontrol edilir.
+
+    Kullanılan sabitler: _MIN_STICKER_AREA_PX2, _MIN_ASPECT_RATIO,
+    _MAX_ASPECT_RATIO, _MIN_COMPACTNESS (solidity eşiği), _MIN_FILL_RATIO.
 
     Returns:
         dict: detected (bool), confidence (float), reason (str|None).
@@ -157,30 +195,79 @@ def detect_sticker_presence(image_bytes: bytes, *, pre_cropped: bool = False) ->
         image = _decode_image(image_bytes)
         image = _resize_for_processing(image, _DETECT_MAX_PX)
         _check_lightness(image)
-        balanced = _white_balance_lab(image)
 
         if pre_cropped:
-            roi_image = balanced
+            roi_image = image
         else:
-            h, w = balanced.shape[:2]
+            h, w = image.shape[:2]
             size = max(30, int(min(h, w) * 0.36))
             cy, cx = h // 2, w // 2
             y1 = max(0, cy - size // 2)
             y2 = min(h, cy + size // 2)
             x1 = max(0, cx - size // 2)
             x2 = min(w, cx + size // 2)
-            roi_image = balanced[y1:y2, x1:x2]
+            roi_image = image[y1:y2, x1:x2]
 
-        mask = _build_sticker_mask(roi_image)
-        pixel_count = int(np.count_nonzero(mask))
+        mask = _build_adaptive_sticker_mask(roi_image, ambient_lux)
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
 
-        if pixel_count > _MIN_CONTOUR_PIXELS:
-            return {"detected": True, "confidence": 0.90, "reason": None}
-        return {
-            "detected": False,
-            "confidence": 0.0,
-            "reason": "sticker_not_detected — Çemberin içine sticker'ı hizalayın.",
-        }
+        if not contours:
+            return {
+                "detected": False,
+                "confidence": 0.0,
+                "reason": "sticker_not_detected — Mor renk bulunamadı.",
+            }
+
+        largest_contour = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(largest_contour)
+
+        if area < _MIN_STICKER_AREA_PX2:
+            return {
+                "detected": False,
+                "confidence": 0.0,
+                "reason": "sticker_not_detected — Mor alan çok küçük (toz/leke olabilir).",
+            }
+
+        x, y, w_rect, h_rect = cv2.boundingRect(largest_contour)
+        if h_rect <= 0:
+            return {
+                "detected": False,
+                "confidence": 0.0,
+                "reason": "sticker_not_detected — Geçersiz kontur.",
+            }
+        aspect_ratio = float(w_rect) / h_rect
+        if not (_MIN_ASPECT_RATIO <= aspect_ratio <= _MAX_ASPECT_RATIO):
+            return {
+                "detected": False,
+                "confidence": 0.0,
+                "reason": "sticker_not_detected — Şekil uygun değil (kare/daire bekleniyor).",
+            }
+
+        hull = cv2.convexHull(largest_contour)
+        hull_area = cv2.contourArea(hull)
+        if hull_area > 0:
+            solidity = area / hull_area
+            if solidity < _MIN_COMPACTNESS:
+                return {
+                    "detected": False,
+                    "confidence": 0.0,
+                    "reason": "sticker_not_detected — Şekil çok dağınık (tişört vb. olabilir).",
+                }
+
+        rect_area = w_rect * h_rect
+        if rect_area > 0:
+            fill_ratio = area / rect_area
+            if fill_ratio < _MIN_FILL_RATIO:
+                return {
+                    "detected": False,
+                    "confidence": 0.0,
+                    "reason": "sticker_not_detected — Doluluk oranı düşük.",
+                }
+
+        return {"detected": True, "confidence": 0.90, "reason": None}
+
     except ValueError as exc:
         reason = str(exc)
         if "insufficient_lighting" in reason or "too dark" in reason.lower():

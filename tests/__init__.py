@@ -1,1 +1,1 @@
-"""Test package — UV Dosimeter backend integration tests."""
+"""Test package — BlancMate backend integration tests."""

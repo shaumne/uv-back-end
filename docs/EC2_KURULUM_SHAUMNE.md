@@ -52,7 +52,7 @@ pip install -r requirements.txt
 
 sudo tee /etc/systemd/system/uv-dosimeter-api.service > /dev/null << 'EOF'
 [Unit]
-Description=UV Dosimeter FastAPI (uv-back-end)
+Description=BlancMate FastAPI (uv-back-end)
 After=network.target
 
 [Service]
@@ -137,7 +137,7 @@ Bu hata **ExecStart** satırındaki çalıştırılabilirin bulunamadığı anla
 ```bash
 sudo tee /etc/systemd/system/uv-dosimeter-api.service > /dev/null << 'EOF'
 [Unit]
-Description=UV Dosimeter FastAPI (uv-back-end)
+Description=BlancMate FastAPI (uv-back-end)
 After=network.target
 
 [Service]

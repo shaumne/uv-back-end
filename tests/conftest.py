@@ -1,5 +1,5 @@
 """
-Pytest configuration and shared fixtures for the UV Dosimeter API test suite.
+Pytest configuration and shared fixtures for the BlancMate API test suite.
 
 Provides:
   - `client` fixture: an httpx.AsyncClient bound to the FastAPI app with

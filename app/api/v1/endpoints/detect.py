@@ -15,7 +15,9 @@ Design intent (v3):
   /analyze can extract colour from the on-screen guide frame region.
 
 Request body (multipart/form-data):
-    image: UploadFile  — camera frame JPEG/PNG
+    image: UploadFile       — camera frame JPEG/PNG
+    pre_cropped: str | None — if 'true', image is already cropped to guide ROI
+    ambient_lux: float      — ambient light in lux (optional; used for adaptive mask)
 
 Response (200):
     {
@@ -57,6 +59,7 @@ async def detect_sticker(
     request: Request,
     image: UploadFile = File(..., description="Camera preview frame (JPEG/PNG)"),
     pre_cropped: str | None = Form(None, description="If 'true', image is already cropped to guide ROI"),
+    ambient_lux: float = Form(1000.0, description="Ambient light sensor reading in lux (for adaptive HSV mask)"),
 ) -> DetectResponse:
     """
     Runs only the sticker-isolation step of the colorimetry pipeline.
@@ -83,7 +86,11 @@ async def detect_sticker(
         return DetectResponse(detected=False, confidence=0.0, reason=str(exc))
 
     use_full_roi = (pre_cropped or "").strip().lower() == "true"
-    result = detect_sticker_presence(image_bytes, pre_cropped=use_full_roi)
+    result = detect_sticker_presence(
+        image_bytes,
+        ambient_lux=ambient_lux,
+        pre_cropped=use_full_roi,
+    )
     logger.debug(
         "[Detect] detected=%s confidence=%.2f reason=%s",
         result["detected"], result["confidence"], result.get("reason"),

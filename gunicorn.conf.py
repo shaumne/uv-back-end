@@ -1,5 +1,5 @@
 """
-Gunicorn production configuration for the UV Dosimeter API.
+Gunicorn production configuration for the BlancMate API.
 
 Usage:
     gunicorn -c gunicorn.conf.py app.main:app

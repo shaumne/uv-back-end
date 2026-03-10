@@ -1,4 +1,4 @@
-# AWS EC2’de UV Dosimeter API — Adım Adım Kurulum
+# AWS EC2’de BlancMate API — Adım Adım Kurulum
 
 Backend’i bir EC2 instance üzerinde çalıştırıp internete açmak için aşağıdaki adımları uygulayın.
 
@@ -170,7 +170,7 @@ Aşağıdaki içeriği yapıştırın. **Yolları** kendi proje dizininize göre
 
 ```ini
 [Unit]
-Description=UV Dosimeter FastAPI
+Description=BlancMate FastAPI
 After=network.target
 
 [Service]

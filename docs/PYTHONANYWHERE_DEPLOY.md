@@ -1,4 +1,4 @@
-# PythonAnywhere’da UV Dosimeter API’yi Yayınlama (Adım Adım)
+# PythonAnywhere’da BlancMate API’yi Yayınlama (Adım Adım)
 
 Test için backend’i ücretsiz PythonAnywhere hesabında çalıştırmak için aşağıdaki adımları uygulayın.
 

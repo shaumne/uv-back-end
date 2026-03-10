@@ -247,14 +247,13 @@ def detect_sticker_presence(
 
         hull = cv2.convexHull(largest_contour)
         hull_area = cv2.contourArea(hull)
-        if hull_area > 0:
-            solidity = area / hull_area
-            if solidity < _MIN_COMPACTNESS:
-                return {
-                    "detected": False,
-                    "confidence": 0.0,
-                    "reason": "sticker_not_detected — Şekil çok dağınık (tişört vb. olabilir).",
-                }
+        solidity = (area / hull_area) if hull_area > 0 else 1.0
+        if hull_area > 0 and solidity < _MIN_COMPACTNESS:
+            return {
+                "detected": False,
+                "confidence": 0.0,
+                "reason": "sticker_not_detected — Şekil çok dağınık (tişört vb. olabilir).",
+            }
 
         rect_area = w_rect * h_rect
         if rect_area > 0:
@@ -266,7 +265,11 @@ def detect_sticker_presence(
                     "reason": "sticker_not_detected — Doluluk oranı düşük.",
                 }
 
-        return {"detected": True, "confidence": 0.90, "reason": None}
+        # Dynamic confidence: aspect ratio 1.0 (perfect square/circle) and high solidity → higher score.
+        shape_score = 1.0 - min(1.0, abs(1.0 - aspect_ratio))
+        confidence = round((shape_score + solidity) / 2.0, 2)
+        confidence = max(0.50, min(1.0, confidence))
+        return {"detected": True, "confidence": confidence, "reason": None}
 
     except ValueError as exc:
         reason = str(exc)
@@ -374,6 +377,12 @@ def _isolate_sticker_pixels(
     """
     ROI: use_full_image_as_roi=True ise tüm görüntü; değilse merkez %45 kare.
     Sadece mor maskesi uygulanır (beyaz/şeffaf dahil değil); yetersiz mor piksel → sticker_not_detected.
+
+    Uses static _build_sticker_mask; the image is already white-balanced in
+    extract_sticker_data, so fixed HSV bounds are sufficient. If in future
+    /analyze struggles with harsh sunlight (washed-out purple), consider
+    switching to _build_adaptive_sticker_mask(roi_image, ambient_lux) and
+    passing ambient_lux into this pipeline.
 
     Returns:
         Shape (N, 3) BGR — sadece mor pikseller.

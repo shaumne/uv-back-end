@@ -592,6 +592,61 @@ def _roi_median_l_to_uv_percent(roi_pixels_bgr: np.ndarray) -> float:
     return round(uv_pct, 1)
 
 
+# ── Delta Analysis (baseline vs evening, Red Channel) ─────────────────────────
+# Avoids medical diagnosis; outputs percentage change in UV stress.
+# Baseline = morning (before sun); evening = after exposure.
+# Red channel mean difference correlates with erythema/UV-induced redness.
+
+
+def compute_delta_uv_stress(
+    baseline_image_bytes: bytes,
+    evening_image_bytes: bytes,
+    ambient_lux_baseline: float = 1000.0,
+    ambient_lux_evening: float = 1000.0,
+) -> dict:
+    """
+    Delta (change) analysis: compares baseline (morning) vs evening skin photo.
+
+    Uses Red channel mean difference as a proxy for UV-induced erythema/stress.
+    Output: percentage change, NOT medical diagnosis.
+
+    Returns:
+        dict: {
+            "delta_percent": float,  # 0–100+ (percentage increase in red channel)
+            "message_key": str,       # For l10n: "uv_stress_increase_detected"
+        }
+    """
+    baseline = _decode_image(baseline_image_bytes)
+    evening = _decode_image(evening_image_bytes)
+    baseline = _resize_for_processing(baseline, _ANALYZE_MAX_PX)
+    evening = _resize_for_processing(evening, _ANALYZE_MAX_PX)
+
+    _check_lightness(baseline)
+    _check_lightness(evening)
+
+    baseline_wb = _adaptive_white_balance(baseline, ambient_lux_baseline)
+    evening_wb = _adaptive_white_balance(evening, ambient_lux_evening)
+
+    # Red channel (BGR index 2) — erythema correlates with increased red
+    red_baseline = float(np.mean(baseline_wb[:, :, 2]))
+    red_evening = float(np.mean(evening_wb[:, :, 2]))
+
+    # Delta as percentage increase over baseline (avoid div-by-zero)
+    if red_baseline <= 1.0:
+        red_baseline = 1.0
+    delta_raw = ((red_evening - red_baseline) / red_baseline) * 100.0
+    delta_percent = round(max(0.0, min(delta_raw, 999.9)), 1)
+
+    logger.info(
+        "[Delta] red_baseline=%.1f red_evening=%.1f delta_pct=%.1f",
+        red_baseline, red_evening, delta_percent,
+    )
+    return {
+        "delta_percent": delta_percent,
+        "message_key": "uv_stress_increase_detected",
+    }
+
+
 def _hex_to_uv_percent(hex_color: str) -> float:
     """
     Converts a '#RRGGBB' hex colour to UV MED percentage via L* interpolation.

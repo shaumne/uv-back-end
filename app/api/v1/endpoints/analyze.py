@@ -19,7 +19,7 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 from ....models.response_models import AnalyzeResponse
-from ....services.colorimetry_service import extract_sticker_data
+from ....services.colorimetry_service import compute_delta_uv_stress, extract_sticker_data
 from ....services.med_calculator import calculate_uv_risk, classify_risk_by_sticker, uv_percent_to_dose_jm2
 from ....utils.image_validator import validate_image
 
@@ -54,6 +54,8 @@ async def analyze_sticker(
     ),
     uv_index: float = Form(default=5.0, ge=0, description="Current UV Index"),
     pre_cropped: str | None = Form(None, description="If 'true', image is already cropped to guide ROI"),
+    daily_context: str | None = Form(None, description="beach_swimming | intense_sport | daily_city"),
+    albedo: str | None = Form(None, description="none | snow | sand (ground reflection)"),
 ) -> AnalyzeResponse:
     """
     Full analysis pipeline:
@@ -128,7 +130,7 @@ async def analyze_sticker(
             detail=str(exc),
         ) from exc
 
-    # ── Step 4: MED / SPF calculation ─────────────────────────────────────────
+    # ── Step 4: MED / SPF calculation (with daily context & albedo) ─────────────
     try:
         risk_payload = calculate_uv_risk(
             fitzpatrick=skin_type,
@@ -136,6 +138,8 @@ async def analyze_sticker(
             hours_since_application=hours_since_application,
             cumulative_dose_jm2=updated_cumulative,
             uv_index=uv_index,
+            daily_context=daily_context,
+            albedo=albedo,
         )
     except ValueError as exc:
         logger.error("MED calculation failed: %s", exc)
@@ -159,8 +163,67 @@ async def analyze_sticker(
     # This ensures the displayed percentage matches what the sticker reads.
     risk_payload["dose_percentage"] = round(min(uv_percent, 999.9), 1)
 
+    # Exclude extra keys not in AnalyzeResponse schema
+    for key in ("daily_context", "albedo"):
+        risk_payload.pop(key, None)
+
     return AnalyzeResponse(
         hex_color=hex_color,
         uv_percent=uv_percent,
         **risk_payload,
     )
+
+
+@router.post(
+    "/delta",
+    summary="Delta UV stress analysis (baseline vs evening)",
+    status_code=status.HTTP_200_OK,
+    responses={
+        422: {"description": "Image validation failure"},
+        429: {"description": "Rate limit exceeded"},
+    },
+)
+@limiter.limit("10/minute")
+async def analyze_delta(
+    request: Request,
+    baseline_image: UploadFile = File(..., description="Morning/baseline skin photo"),
+    evening_image: UploadFile = File(..., description="Evening skin photo"),
+    ambient_lux_baseline: float = Form(default=1000.0, ge=0),
+    ambient_lux_evening: float = Form(default=1000.0, ge=0),
+) -> dict:
+    """
+    Delta analysis: Red channel difference between baseline (morning) and evening.
+    Output: percentage change in UV stress — NOT medical diagnosis.
+    """
+    try:
+        baseline_bytes = await baseline_image.read()
+        evening_bytes = await evening_image.read()
+    except Exception as exc:
+        logger.error("Failed to read delta images: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Could not read uploaded images.",
+        ) from exc
+
+    for name, data in [("baseline", baseline_bytes), ("evening", evening_bytes)]:
+        try:
+            validate_image(data)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{name}: {exc}",
+            ) from exc
+
+    try:
+        result = compute_delta_uv_stress(
+            baseline_image_bytes=baseline_bytes,
+            evening_image_bytes=evening_bytes,
+            ambient_lux_baseline=ambient_lux_baseline,
+            ambient_lux_evening=ambient_lux_evening,
+        )
+        return result
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc

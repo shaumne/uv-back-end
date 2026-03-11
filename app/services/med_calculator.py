@@ -45,6 +45,34 @@ _K2 = 0.05
 # ── Sunscreen reapplication threshold ────────────────────────────────────────
 _REAPPLY_THRESHOLD = 0.5  # flag if SPF_eff < SPF_applied × 0.5
 
+# ── Daily context: mechanical loss & activity factors ──────────────────────────
+# Swimming: water-resistant SPF standard → 40 min (SPF<30) or 80 min (SPF≥30) hard limit.
+# Per FDA water-resistance testing (80 min in water).
+_SWIMMING_HARD_LIMIT_SPF_LOW = 40.0   # minutes when SPF < 30
+_SWIMMING_HARD_LIMIT_SPF_HIGH = 80.0  # minutes when SPF >= 30
+_SWIMMING_SPF_THRESHOLD = 30
+
+# ── Albedo (ground reflection) UV load multipliers ───────────────────────────
+# Snow ~80% reflectance, sand ~15%, grass ~3%, water ~5%.
+# Multiplier > 1 increases effective UV irradiance.
+_ALBEDO_SNOW = 1.80   # ~80% reflection → +80% effective UV
+_ALBEDO_SAND = 1.15   # ~15% reflection → +15% effective UV
+_ALBEDO_DEFAULT = 1.0
+
+
+class DailyContext(str, Enum):
+    """User's daily activity context — affects mechanical loss and UV load."""
+    BEACH_SWIMMING = "beach_swimming"
+    INTENSE_SPORT = "intense_sport"
+    DAILY_CITY = "daily_city"
+
+
+class AlbedoType(str, Enum):
+    """Ground surface reflection — increases effective UV irradiance."""
+    NONE = "none"
+    SNOW = "snow"
+    SAND = "sand"
+
 
 class RiskLevel(str, Enum):
     """Five-tier UV risk classification matching the Dermatology_Math_Engine skill."""
@@ -59,12 +87,31 @@ class RiskLevel(str, Enum):
 # Public API
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _albedo_multiplier(albedo: str | None) -> float:
+    """Returns UV irradiance multiplier for ground reflection (albedo)."""
+    if not albedo or albedo == AlbedoType.NONE.value:
+        return _ALBEDO_DEFAULT
+    if albedo == AlbedoType.SNOW.value:
+        return _ALBEDO_SNOW
+    if albedo == AlbedoType.SAND.value:
+        return _ALBEDO_SAND
+    return _ALBEDO_DEFAULT
+
+
+def _swimming_hard_limit_minutes(spf: float) -> float:
+    """Water-resistant SPF standard: 40 min (SPF<30) or 80 min (SPF≥30)."""
+    return _SWIMMING_HARD_LIMIT_SPF_HIGH if spf >= _SWIMMING_SPF_THRESHOLD else _SWIMMING_HARD_LIMIT_SPF_LOW
+
+
 def calculate_uv_risk(
     fitzpatrick: int,
     spf: float,
     hours_since_application: float,
     cumulative_dose_jm2: float,
     uv_index: float,
+    *,
+    daily_context: str | None = None,
+    albedo: str | None = None,
 ) -> dict:
     """
     Full UV risk calculation — returns a production-ready payload dict.
@@ -75,6 +122,8 @@ def calculate_uv_risk(
         hours_since_application:   Hours since sunscreen was applied (float).
         cumulative_dose_jm2:       UV dose already received today in J/m².
         uv_index:                  Current real-time UV Index value.
+        daily_context:             Optional: beach_swimming | intense_sport | daily_city.
+        albedo:                    Optional: none | snow | sand (ground reflection).
 
     Returns:
         Dict with keys matching [UVRiskResponse] Pydantic model.
@@ -86,11 +135,20 @@ def calculate_uv_risk(
     spf_eff = spf_effective(spf, hours_since_application)
     med_protected = med_base * spf_eff
 
+    # Apply albedo multiplier to effective UV irradiance
+    albedo_mult = _albedo_multiplier(albedo)
+    effective_uv_index = uv_index * albedo_mult
+
     minutes_rem = remaining_safe_minutes(
         cumulative_dose_jm2=cumulative_dose_jm2,
         med_protected=med_protected,
-        uv_index=uv_index,
+        uv_index=effective_uv_index,
     )
+
+    # Swimming: hard limit overrides theoretical remaining time
+    if daily_context == DailyContext.BEACH_SWIMMING.value:
+        swimming_limit = _swimming_hard_limit_minutes(spf_eff)
+        minutes_rem = min(minutes_rem, swimming_limit)
 
     dose_pct = (cumulative_dose_jm2 / med_protected * 100.0) if med_protected > 0 else 0.0
     risk = classify_risk(minutes_rem, cumulative_dose_jm2, med_protected)
@@ -107,6 +165,8 @@ def calculate_uv_risk(
         "minutes_remaining": round(max(0.0, minutes_rem), 1),
         "risk_level": risk.value,
         "sunscreen_reapply_recommended": reapply,
+        "daily_context": daily_context,
+        "albedo": albedo,
     }
 
     logger.info(

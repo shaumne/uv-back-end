@@ -81,7 +81,7 @@ _MIN_ROI_SATURATION = 0
 _LUX_HIGH_SUN = 10000.0   # lux above this → Shades of Grey
 _LUX_LOW = 300.0          # lux below this → gamma correction then WB
 _SOG_P = 6.0              # p-norm exponent (higher = less influence from extremes)
-_GAMMA_LOW_LIGHT = 0.75   # gamma < 1 brightens (recover dark regions)
+_GAMMA_LOW_LIGHT = 1.2    # gamma > 1 → inv_gamma < 1 → brightens dark regions
 
 
 # ── Image resize helper ───────────────────────────────────────────────────────
@@ -377,7 +377,8 @@ def _white_balance_lab_sog(image: np.ndarray, p: float = _SOG_P) -> np.ndarray:
 
 def _gamma_correct(image: np.ndarray, gamma: float) -> np.ndarray:
     """
-    Gamma correction: out = (in/255)^gamma * 255. Gamma < 1 brightens (low light).
+    Gamma correction: out = (in/255)^(1/gamma) * 255.
+    Gamma > 1 (e.g. 1.2) brightens dark regions for low-light recovery.
     """
     inv_gamma = 1.0 / gamma
     lut = np.clip(

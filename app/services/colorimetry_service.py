@@ -70,8 +70,16 @@ _ANALYZE_CONFIDENCE_THRESHOLD = 0.50
 # Minimum mean LAB L* for the whole image (skill: reject if mean L* < 20).
 _MIN_LIGHTNESS = 20.0
 
-# Minimum pixel count inside a contour for K-Means.
+# Minimum pixel count inside the ROI mask for K-Means.
+# This acts as an absolute floor; the effective threshold is:
+#   max(_MIN_CONTOUR_PIXELS, roi_area_px * _MIN_STICKER_PIXEL_FRACTION)
 _MIN_CONTOUR_PIXELS = 20
+
+# Dynamic lower bound for sticker pixels as a fraction of ROI area.
+# 0.0001 = 0.01% of pixels. On a 960×960 ROI (~921,600 px) this is ~92 px,
+# which is large enough to reject random purple noise, but small enough to
+# accept slightly off-centre or partially occluded stickers.
+_MIN_STICKER_PIXEL_FRACTION = 0.0001
 
 # Mean HSV saturation gate on the extracted ROI (unused when contour-only path).
 _MIN_ROI_SATURATION = 0
@@ -469,10 +477,20 @@ def _isolate_sticker_pixels(
     mask = _build_sticker_mask(roi_image)
     sticker_pixels = roi_image[mask > 0]
 
-    if len(sticker_pixels) < _MIN_CONTOUR_PIXELS:
+    roi_h, roi_w = roi_image.shape[:2]
+    roi_area_px = max(1, roi_h * roi_w)
+    dynamic_min_pixels = max(
+        _MIN_CONTOUR_PIXELS,
+        int(roi_area_px * _MIN_STICKER_PIXEL_FRACTION),
+    )
+
+    if len(sticker_pixels) < dynamic_min_pixels:
         logger.warning(
-            "[Colorimetry] Merkez alanda sticker rengi yetersiz (%d piksel).",
+            "[Colorimetry] ROI'da sticker rengi yetersiz (bulunan=%d, eşik=%d, roi=%dx%d).",
             len(sticker_pixels),
+            dynamic_min_pixels,
+            roi_w,
+            roi_h,
         )
         raise ValueError(
             "sticker_not_detected — Hedef alanda sticker bulunamadı. "
@@ -490,27 +508,46 @@ def _isolate_sticker_pixels(
 
 def _is_sticker_plausible_colour(hex_color: str) -> bool:
     """
-    Sadece mor kabul. Beyaz/şeffaf ve mor dışı her renk reddedilir.
-    OpenCV HSV: mor H 108–178 (lavanta, mor, indigo). S=0 / L* çok yüksek = beyaz → False.
+    Sadece foto-kromik mor sticker gamı kabul edilir.
+
+    Maskeleme aşamasında zaten mor HSV spektrumu (H≈100–178) filtrelenmiştir.
+    Bu aşamadaki kontrol, rengi ikinci kez "mor mu?" diye sormak yerine,
+    LAB uzayında aşağıdaki kriterlere göre fiziksel olarak makul bir
+    sticker rengi olup olmadığını doğrular:
+
+    - L* çok uçlarda olmamalı (aşırı beyaz / neredeyse siyah değil).
+    - Chroma (sqrt(a² + b²)) belirli bir eşiğin üzerinde olmalı (grimsi tonlar reddedilir).
+    - a* hafifçe pozitif, b* negatif: mor / menekşe bölgesi.
+
+    Böylece mor maskesinden geçen ama gerçekte sticker olmayan,
+    örneğin çok soluk, parçalı veya kalibrasyon eğrisinin tamamen
+    dışında kalan pikseller elenir.
     """
     h = hex_color.lstrip("#")
     if len(h) != 6:
         return False
     r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
     bgr = np.uint8([[[b, g, r]]])
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[0][0]
-    H, S = int(hsv[0]), int(hsv[1])
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)[0][0]
 
-    # Beyaz/şeffaf: doygunluk çok düşük → mor değil
-    if S <= 15:
+    l_star = float(lab[0]) / 2.55
+    a_star = float(lab[1]) - 128.0
+    b_star = float(lab[2]) - 128.0
+    chroma = math.sqrt(a_star ** 2 + b_star ** 2)
+
+    # Aşırı beyaz / siyah tonlar veya neredeyse renksiz (düşük chroma) reddedilir.
+    if l_star < 5.0 or l_star > 99.0:
         return False
-    # Sadece mor spektrumu: H 108–178 (lavanta, mor, indigo)
-    if 108 <= H <= 178:
-        return True
-    # OpenCV'de H 0–179; mor/magenta sınırı
-    if 175 <= H <= 179:
-        return True
-    return False
+    if chroma < 8.0:
+        return False
+
+    # Mor gamı: a* hafifçe pozitif, b* negatif (kırmızı-mor / mavi-mor bandı).
+    if a_star < -10.0 or a_star > 80.0:
+        return False
+    if b_star > 15.0 or b_star < -100.0:
+        return False
+
+    return True
 
 
 # ── Step 4 — Dominant colour (K-Means k=3, skill: highest pixel count) ─────────
@@ -590,61 +627,6 @@ def _roi_median_l_to_uv_percent(roi_pixels_bgr: np.ndarray) -> float:
         l_median, uv_pct,
     )
     return round(uv_pct, 1)
-
-
-# ── Delta Analysis (baseline vs evening, Red Channel) ─────────────────────────
-# Avoids medical diagnosis; outputs percentage change in UV stress.
-# Baseline = morning (before sun); evening = after exposure.
-# Red channel mean difference correlates with erythema/UV-induced redness.
-
-
-def compute_delta_uv_stress(
-    baseline_image_bytes: bytes,
-    evening_image_bytes: bytes,
-    ambient_lux_baseline: float = 1000.0,
-    ambient_lux_evening: float = 1000.0,
-) -> dict:
-    """
-    Delta (change) analysis: compares baseline (morning) vs evening skin photo.
-
-    Uses Red channel mean difference as a proxy for UV-induced erythema/stress.
-    Output: percentage change, NOT medical diagnosis.
-
-    Returns:
-        dict: {
-            "delta_percent": float,  # 0–100+ (percentage increase in red channel)
-            "message_key": str,       # For l10n: "uv_stress_increase_detected"
-        }
-    """
-    baseline = _decode_image(baseline_image_bytes)
-    evening = _decode_image(evening_image_bytes)
-    baseline = _resize_for_processing(baseline, _ANALYZE_MAX_PX)
-    evening = _resize_for_processing(evening, _ANALYZE_MAX_PX)
-
-    _check_lightness(baseline)
-    _check_lightness(evening)
-
-    baseline_wb = _adaptive_white_balance(baseline, ambient_lux_baseline)
-    evening_wb = _adaptive_white_balance(evening, ambient_lux_evening)
-
-    # Red channel (BGR index 2) — erythema correlates with increased red
-    red_baseline = float(np.mean(baseline_wb[:, :, 2]))
-    red_evening = float(np.mean(evening_wb[:, :, 2]))
-
-    # Delta as percentage increase over baseline (avoid div-by-zero)
-    if red_baseline <= 1.0:
-        red_baseline = 1.0
-    delta_raw = ((red_evening - red_baseline) / red_baseline) * 100.0
-    delta_percent = round(max(0.0, min(delta_raw, 999.9)), 1)
-
-    logger.info(
-        "[Delta] red_baseline=%.1f red_evening=%.1f delta_pct=%.1f",
-        red_baseline, red_evening, delta_percent,
-    )
-    return {
-        "delta_percent": delta_percent,
-        "message_key": "uv_stress_increase_detected",
-    }
 
 
 def _hex_to_uv_percent(hex_color: str) -> float:

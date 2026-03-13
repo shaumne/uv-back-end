@@ -11,20 +11,15 @@ Registers:
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 
 from .api.v1.endpoints.analyze import router as analyze_router
 from .api.v1.endpoints.detect import router as detect_router
 from .core.config import settings
+from .core.rate_limiter import limiter
 from .core.logging import configure_logging, logger
 from .middleware.auth import ApiKeyMiddleware
-
-# ── Rate limiter (shared across endpoints) ────────────────────────────────────
-
-limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
-
 
 def create_app() -> FastAPI:
     configure_logging(debug=settings.debug)

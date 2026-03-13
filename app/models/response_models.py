@@ -27,6 +27,11 @@ class AnalyzeResponse(BaseModel):
         minutes_remaining:         Safe sun exposure time left (minutes).
         risk_level:                One of: safe | caution | warning | danger | exceeded
         sunscreen_reapply_recommended: True when SPF_eff < SPF_applied × 0.5.
+
+    Sticker/cilt ayrışımı için ek alanlar:
+        sticker_dose_jm2:               Sticker okumasından türetilen doz (J/m²).
+        previous_cumulative_dose_jm2:   İstekle gelen kümülatif doz (J/m²).
+        sticker_reset_suspected:        Sticker okuması belirgin şekilde düşükse True.
     """
     # ── Colorimetry ───────────────────────────────────────────────────────────
     hex_color: str = Field(..., description="Dominant sticker colour in #RRGGBB format")
@@ -44,6 +49,25 @@ class AnalyzeResponse(BaseModel):
     risk_level: str = Field(..., pattern="^(safe|caution|warning|danger|exceeded)$")
     sunscreen_reapply_recommended: bool = Field(
         ..., description="True when SPF degradation exceeds 50% of original"
+    )
+
+    # ── Sticker / cilt ayrışımı metadatası ──────────────────────────────────────
+    sticker_dose_jm2: float = Field(
+        ...,
+        ge=0,
+        description="Dose implied by current sticker reading (J/m²)",
+    )
+    previous_cumulative_dose_jm2: float = Field(
+        ...,
+        ge=0,
+        description="Cumulative dose value sent by client before this scan (J/m²)",
+    )
+    sticker_reset_suspected: bool = Field(
+        ...,
+        description=(
+            "True when sticker_dose_jm2 is significantly lower than the previous "
+            "cumulative dose, suggesting a new sticker or anomalous reading."
+        ),
     )
 
 
